@@ -1,4 +1,5 @@
 /build*/
+/dist/parakeet-lp-server-1.0.0-bundled.tar
 /.venv/
 /third_party/.ggml-patch.lock
 /models/*
