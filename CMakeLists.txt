@@ -12,6 +12,7 @@ endif()
 option(PARAKEET_BUILD_TESTS "Build ctest targets" OFF)
 option(PARAKEET_BUILD_CLI   "Build parakeet-cli" ON)
 option(PARAKEET_BUILD_SERVER "Build parakeet-server (OpenAI-compatible example)" ON)
+option(PARAKEET_BUILD_LP_SERVER "Build parakeet-lp-server (Arabic/English LID example)" ON)
 option(PARAKEET_SHARED      "Build libparakeet as shared" OFF)
 option(PARAKEET_GGML_CUDA   "Forward GGML_CUDA" OFF)
 option(PARAKEET_GGML_METAL  "Forward GGML_METAL" OFF)
@@ -76,6 +77,7 @@ set(PARAKEET_SRC
     src/fft.cpp
     src/mel.cpp
     src/mel_gpu.cpp
+    src/lid.cpp
     src/subsampling.cpp
     src/relpos_attention.cpp
     src/conformer.cpp
@@ -114,6 +116,9 @@ if(PARAKEET_BUILD_CLI)
 endif()
 if(PARAKEET_BUILD_SERVER)
   add_subdirectory(examples/server)
+endif()
+if(PARAKEET_BUILD_LP_SERVER)
+  add_subdirectory(examples/lp_server)
 endif()
 if(PARAKEET_BUILD_TESTS)
   enable_testing()

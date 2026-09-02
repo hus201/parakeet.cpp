@@ -3,6 +3,7 @@
 #include "model.hpp"
 #include "model_loader.hpp"
 #include "audio_io.hpp"
+#include "lid.hpp"
 #include "streaming.hpp"
 #include "transcription.hpp"
 #include "ggml_graph.hpp"   // pk::set_num_threads, pk::global_backend
@@ -113,6 +114,50 @@ static bool load_audio_arg_16k_mono(const std::string& input, pk::Audio& out) {
 static float model_frame_sec(const pk::Model& model) {
     const pk::ParakeetConfig& cfg = model.config();
     return (float)cfg.hop_length * (float)cfg.subsampling_factor / (float)cfg.sample_rate;
+}
+
+// parakeet-cli lid --model <ecapa-lid.gguf> --input <wav> [--threads N]
+static int cmd_lid(int argc, char** argv) {
+    std::string model, input;
+    int threads = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            model = argv[++i];
+        } else if (std::strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+            input = argv[++i];
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
+        }
+    }
+    if (model.empty() || input.empty()) {
+        std::fprintf(stderr,
+            "usage: parakeet-cli lid --model <ecapa-lid.gguf> --input <wav> [--threads N]\n");
+        return 2;
+    }
+
+    pk::Audio audio;
+    if (!pk::load_audio_16k_mono(input, audio)) {
+        std::fprintf(stderr, "parakeet-cli: failed to load audio %s\n", input.c_str());
+        return 1;
+    }
+
+    ecapa_lid_context* ctx = ecapa_lid_init(model.c_str(), threads);
+    if (!ctx) {
+        std::fprintf(stderr, "parakeet-cli: failed to load LID model %s\n", model.c_str());
+        return 1;
+    }
+
+    float confidence = 0.0f;
+    const char* language = ecapa_lid_detect(ctx, audio.samples.data(),
+                                             (int)audio.samples.size(), &confidence);
+    if (!language) {
+        std::fprintf(stderr, "parakeet-cli: language detection failed\n");
+        ecapa_lid_free(ctx);
+        return 1;
+    }
+    std::printf("%s\t%.4f\n", language, confidence);
+    ecapa_lid_free(ctx);
+    return 0;
 }
 
 // Cache-aware streaming transcription for the EOU streaming model. Feeds the WAV
@@ -1355,6 +1400,8 @@ int main(int argc, char** argv) {
         return run_and_shutdown([](int, char** a) { return cmd_info(a[0]); }, 1, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "transcribe") == 0)
         return run_and_shutdown(cmd_transcribe, argc - 2, argv + 2);
+    if (argc >= 2 && std::strcmp(argv[1], "lid") == 0)
+        return run_and_shutdown(cmd_lid, argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "quantize") == 0)
         return run_and_shutdown(cmd_quantize, argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "bench-batch") == 0)
@@ -1370,6 +1417,7 @@ int main(int argc, char** argv) {
         "[--decoder ctc|tdt] [--lang <locale>] [--stream] [--timestamps] "
         "[--threads N] [--json] "
         "[--beam-size N [--nbest N] [--no-score-norm]]\n"
+        "  parakeet-cli lid --model <ecapa-lid.gguf> --input <wav> [--threads N]\n"
         "  parakeet-cli quantize <in.gguf> <out.gguf> "
         "<q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>\n"
         "  parakeet-cli bench --model <model.gguf> --manifest <file> "

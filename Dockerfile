@@ -28,7 +28,7 @@ ARG BUILD_BASE=ubuntu:24.04
 ARG RUNTIME_BASE=ubuntu:24.04
 
 # ---------------------------------------------------------------------------
-# build: configure + compile parakeet-cli and the ggml backends.
+# build: configure + compile the CLI and HTTP servers with their ggml backends.
 # ---------------------------------------------------------------------------
 FROM ${BUILD_BASE} AS build
 
@@ -64,6 +64,7 @@ RUN cmake -B build \
         -DGGML_NATIVE=OFF \
         -DPARAKEET_BUILD_CLI=ON \
         -DPARAKEET_BUILD_SERVER=ON \
+        -DPARAKEET_BUILD_LP_SERVER=ON \
         -DPARAKEET_BUILD_TESTS=OFF \
         ${CMAKE_EXTRA_ARGS} \
         ${CUDA_ARCHS:+"-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}"} \
@@ -75,6 +76,7 @@ RUN cmake -B build \
 RUN mkdir -p /install/bin /install/lib \
     && cp build/examples/cli/parakeet-cli /install/bin/ \
     && cp build/examples/server/parakeet-server /install/bin/ \
+    && cp build/examples/lp_server/parakeet-lp-server /install/bin/ \
     && find build -name '*.so*' -exec cp -av {} /install/lib/ \;
 
 # ---------------------------------------------------------------------------
@@ -106,6 +108,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /install/bin/parakeet-server /usr/local/bin/
 EXPOSE 8080
 ENTRYPOINT ["parakeet-server", "--host", "0.0.0.0"]
+CMD ["--help"]
+
+# LID-routed Arabic/English OpenAI server. Mount the three GGUF model files at
+# /work, or override the corresponding paths with command-line arguments.
+FROM runtime-base AS runtime-lp-server
+COPY --from=build /install/bin/parakeet-lp-server /usr/local/bin/
+EXPOSE 8080
+ENTRYPOINT ["parakeet-lp-server", "--host", "0.0.0.0"]
 CMD ["--help"]
 
 # ---------------------------------------------------------------------------

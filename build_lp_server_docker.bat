@@ -1,0 +1,1 @@
+docker --context azure-docker build --target runtime -f examples/lp_server/Dockerfile -t parakeet-lp-server:1.0.0 .
