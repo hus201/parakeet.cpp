@@ -8,12 +8,14 @@
 #include "parakeet.h"
 #include "transcription.hpp"
 
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -22,6 +24,7 @@ constexpr size_t kMaxUploadBytes = 64 * 1024 * 1024;
 constexpr const char* kDefaultArabicModel = "stt_ar_fastconformer_hybrid_large_pcd_v1.0-q4_0.gguf";
 constexpr const char* kDefaultEnglishModel = "parakeet-tdt_ctc-110m-q4_0.gguf";
 constexpr const char* kDefaultLidModel = "ecapa-lid-voxlingua107.gguf";
+constexpr const char* kDefaultSupportedLanguages = "ar,en";
 
 httplib::Server* g_server = nullptr;
 void on_signal(int) { if (g_server) g_server->stop(); }
@@ -62,14 +65,94 @@ std::vector<float> resample_to_16k(const std::vector<float>& pcm, int sample_rat
     return output;
 }
 
+std::string to_lower_ascii(std::string value) {
+    for (char& c : value) {
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    }
+    return value;
+}
+
+std::vector<std::string> parse_language_list(const std::string& csv) {
+    std::vector<std::string> languages;
+    std::string current;
+    for (char c : csv) {
+        if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c))) {
+            if (!current.empty()) {
+                languages.push_back(to_lower_ascii(current));
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty())
+        languages.push_back(to_lower_ascii(current));
+    return languages;
+}
+
+std::vector<std::string> collect_request_languages(const httplib::Request& request) {
+    std::vector<std::string> requested;
+    auto append_parts = [&](const char* field) {
+        for (const auto& value : request.get_file_values(field)) {
+            for (const std::string& code : parse_language_list(value.content))
+                requested.push_back(code);
+        }
+    };
+    // OpenAI uses repeated languages[] parts; also accept a single CSV languages field.
+    append_parts("languages[]");
+    append_parts("languages");
+    return requested;
+}
+
+std::string join_languages(const std::vector<std::string>& languages) {
+    std::string out;
+    for (size_t i = 0; i < languages.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        out += languages[i];
+    }
+    return out;
+}
+
+// Intersect requested codes with the process-allowed set, preserving request order.
+std::vector<std::string> resolve_request_languages(
+    const std::vector<std::string>& requested,
+    const std::vector<std::string>& process_supported) {
+    std::vector<std::string> resolved;
+    for (const std::string& code : requested) {
+        bool allowed = false;
+        for (const std::string& supported : process_supported) {
+            if (code == supported) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed)
+            continue;
+        bool already = false;
+        for (const std::string& existing : resolved) {
+            if (existing == code) {
+                already = true;
+                break;
+            }
+        }
+        if (!already)
+            resolved.push_back(code);
+    }
+    return resolved;
+}
+
 void usage() {
     std::fprintf(stderr,
         "usage: parakeet-lp-server [--arabic-model <path>] [--english-model <path>]\n"
-        "                           [--lid-model <path>] [--host <host>] [--port <port>]\n"
-        "                           [--threads <n>]\n\n"
+        "                           [--lid-model <path>] [--supported-languages <list>]\n"
+        "                           [--host <host>] [--port <port>] [--threads <n>]\n\n"
         "Defaults load the three GGUF files from the current working directory:\n"
-        "  %s\n  %s\n  %s\n",
-        kDefaultArabicModel, kDefaultEnglishModel, kDefaultLidModel);
+        "  %s\n  %s\n  %s\n\n"
+        "--supported-languages defaults to \"%s\". LID picks the highest-scoring\n"
+        "language among that list after softmax.\n",
+        kDefaultArabicModel, kDefaultEnglishModel, kDefaultLidModel,
+        kDefaultSupportedLanguages);
 }
 
 } // namespace
@@ -78,6 +161,7 @@ int main(int argc, char** argv) {
     std::string arabic_path = kDefaultArabicModel;
     std::string english_path = kDefaultEnglishModel;
     std::string lid_path = kDefaultLidModel;
+    std::string supported_languages_csv = kDefaultSupportedLanguages;
     std::string host = "127.0.0.1";
     int port = 8080;
     int threads = 0;
@@ -94,6 +178,7 @@ int main(int argc, char** argv) {
         if (arg == "--arabic-model") arabic_path = next("--arabic-model");
         else if (arg == "--english-model") english_path = next("--english-model");
         else if (arg == "--lid-model") lid_path = next("--lid-model");
+        else if (arg == "--supported-languages") supported_languages_csv = next("--supported-languages");
         else if (arg == "--host") host = next("--host");
         else if (arg == "--port") port = std::atoi(next("--port").c_str());
         else if (arg == "--threads") threads = std::atoi(next("--threads").c_str());
@@ -125,6 +210,33 @@ int main(int argc, char** argv) {
         pk::shutdown_backend();
         return 1;
     }
+
+    std::unordered_map<std::string, pk::Model*> models_by_language = {
+        {"ar", arabic.get()},
+        {"en", english.get()},
+    };
+
+    std::vector<std::string> supported_languages = parse_language_list(supported_languages_csv);
+    for (const std::string& code : supported_languages) {
+        if (models_by_language.find(code) == models_by_language.end()) {
+            std::fprintf(stderr,
+                "parakeet-lp-server: unsupported language in --supported-languages: '%s'\n"
+                "  configured recognizers: ar, en\n",
+                code.c_str());
+            pk::shutdown_backend();
+            return 2;
+        }
+    }
+    if (supported_languages.empty()) {
+        std::fprintf(stderr, "parakeet-lp-server: --supported-languages must not be empty\n");
+        pk::shutdown_backend();
+        return 2;
+    }
+
+    std::fprintf(stderr, "parakeet-lp-server: supported languages for LID routing:");
+    for (const std::string& code : supported_languages)
+        std::fprintf(stderr, " %s", code.c_str());
+    std::fprintf(stderr, "\n");
 
     // The Parakeet and ECAPA graph allocators are process-global; serialize graph execution.
     std::mutex inference_mutex;
@@ -164,6 +276,22 @@ int main(int argc, char** argv) {
             for (const auto& value : request.get_file_values("timestamp_granularities[]"))
                 if (value.content == "word") include_words = true;
 
+            std::vector<std::string> request_languages = supported_languages;
+            const auto requested = collect_request_languages(request);
+            if (!requested.empty()) {
+                request_languages = resolve_request_languages(requested, supported_languages);
+                if (request_languages.empty()) {
+                    fail(400, "languages has no overlap with server-configured languages (" +
+                                  supported_languages_csv + ")");
+                    return;
+                }
+            }
+
+            std::vector<const char*> request_allowed_ptrs;
+            request_allowed_ptrs.reserve(request_languages.size());
+            for (const std::string& code : request_languages)
+                request_allowed_ptrs.push_back(code.c_str());
+
             const std::string& bytes = request.get_file_value("file").content;
             std::vector<float> pcm;
             int sample_rate = 0;
@@ -179,19 +307,39 @@ int main(int argc, char** argv) {
                 pk::Transcription transcription;
                 {
                     std::lock_guard<std::mutex> lock(inference_mutex);
-                    language = ecapa_lid_detect(lid.get(), lid_pcm.data(),
-                                                static_cast<int>(lid_pcm.size()), &confidence);
-                    if (!language) throw std::runtime_error("language detection failed");
-                    pk::Model* model = std::string(language) == "ar" ? arabic.get() :
-                                       std::string(language) == "en" ? english.get() : nullptr;
-                    if (!model) {
+                    language = ecapa_lid_detect_among(
+                        lid.get(),
+                        lid_pcm.data(),
+                        static_cast<int>(lid_pcm.size()),
+                        request_allowed_ptrs.data(),
+                        static_cast<int>(request_allowed_ptrs.size()),
+                        &confidence);
+                    if (!language) {
                         response.status = 422;
-                        response.set_content(error_body("detected language '" + std::string(language) +
-                                                        "' is not supported; only ar and en are configured",
-                                                        "unsupported_language"), "application/json");
+                        response.set_content(
+                            error_body(
+                                "no supported language matched LID scores; candidates: " +
+                                    join_languages(request_languages),
+                                "unsupported_language"),
+                            "application/json");
                         return;
                     }
-                    transcription = model->transcribe_with_timestamps(pcm, sample_rate, pk::Decoder::kDefault);
+
+                    const std::string selected = to_lower_ascii(language);
+                    auto model_it = models_by_language.find(selected);
+                    if (model_it == models_by_language.end() || !model_it->second) {
+                        response.status = 422;
+                        response.set_content(
+                            error_body(
+                                "detected language '" + selected +
+                                    "' is not configured with a recognizer",
+                                "unsupported_language"),
+                            "application/json");
+                        return;
+                    }
+                    transcription = model_it->second->transcribe_with_timestamps(
+                        pcm, sample_rate, pk::Decoder::kDefault);
+                    language = model_it->first.c_str();
                 }
                 Response output = format_transcription(
                     transcription, format, static_cast<double>(pcm.size()) / sample_rate, include_words);

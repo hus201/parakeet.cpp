@@ -375,8 +375,41 @@ extern "C" void ecapa_lid_free(struct ecapa_lid_context* ctx) {
 // Detect — builds ggml graph for entire forward pass
 // ===========================================================================
 
+static bool lang_code_eq(const std::string& label, const char* code) {
+    if (!code || !*code)
+        return false;
+    size_t i = 0;
+    for (; i < label.size() && code[i]; ++i) {
+        char a = label[i];
+        char b = code[i];
+        if (a >= 'A' && a <= 'Z')
+            a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = static_cast<char>(b - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return i == label.size() && code[i] == '\0';
+}
+
+static bool label_is_allowed(const std::string& label, const char* const* allowed_languages, int n_allowed) {
+    if (!allowed_languages || n_allowed <= 0)
+        return true;
+    for (int i = 0; i < n_allowed; ++i) {
+        if (lang_code_eq(label, allowed_languages[i]))
+            return true;
+    }
+    return false;
+}
+
 extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const float* samples, int n_samples,
                                         float* confidence) {
+    return ecapa_lid_detect_among(ctx, samples, n_samples, nullptr, 0, confidence);
+}
+
+extern "C" const char* ecapa_lid_detect_among(struct ecapa_lid_context* ctx, const float* samples, int n_samples,
+                                              const char* const* allowed_languages, int n_allowed,
+                                              float* confidence) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     auto& m = ctx->model;
@@ -857,16 +890,25 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         }
     }
 
-    // Softmax + argmax
+    // Softmax, then argmax — optionally constrained to allowed language codes.
+    // Confidence is the raw softmax mass of the selected class (not renormalized),
+    // matching text LID's "filter then pick highest confidence" behavior.
     float mx = *std::max_element(logits.begin(), logits.end());
     float sum = 0;
     for (auto& v : logits) {
         v = expf(v - mx);
         sum += v;
     }
-    int best = 0;
-    float best_conf = logits[0] / sum;
-    for (int i = 1; i < m.n_classes; i++) {
+    if (sum <= 0.0f)
+        return nullptr;
+
+    int best = -1;
+    float best_conf = -1.0f;
+    const int n_labels = (int)m.labels.size();
+    const int n = m.n_classes < n_labels ? m.n_classes : n_labels;
+    for (int i = 0; i < n; i++) {
+        if (!label_is_allowed(m.labels[i], allowed_languages, n_allowed))
+            continue;
         float p = logits[i] / sum;
         if (p > best_conf) {
             best_conf = p;
@@ -874,11 +916,11 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         }
     }
 
+    if (best < 0)
+        return nullptr;
+
     if (confidence)
         *confidence = best_conf;
-    if (best >= 0 && best < (int)m.labels.size()) {
-        ctx->last_result = m.labels[best];
-        return ctx->last_result.c_str();
-    }
-    return nullptr;
+    ctx->last_result = m.labels[best];
+    return ctx->last_result.c_str();
 }

@@ -10,8 +10,13 @@ and routes the audio to the matching recognizer:
 | `ar` | Arabic FastConformer hybrid model |
 | `en` | English Parakeet TDT/CTC hybrid model |
 
-The server returns HTTP `422` for all other detected languages. It never falls
-back to a recognizer for the wrong language.
+LID applies a supported-languages filter after softmax over VoxLingua107: the
+server picks the highest-scoring language among `--supported-languages`
+(default `ar,en`), not the unconstrained top-1. That recovers cases where a
+confusable language ranks first but Arabic or English is a strong runner-up.
+HTTP `422` is returned only when no configured language matches a model label.
+The server never falls back to a recognizer for a language that is not in the
+supported list.
 
 ## Features
 
@@ -90,6 +95,7 @@ All options are supplied at process start:
 | `--arabic-model <path>` | `stt_ar_fastconformer_hybrid_large_pcd_v1.0-q4_0.gguf` | Arabic GGUF path |
 | `--english-model <path>` | `parakeet-tdt_ctc-110m-q4_0.gguf` | English GGUF path |
 | `--lid-model <path>` | `ecapa-lid-voxlingua107.gguf` | ECAPA LID GGUF path |
+| `--supported-languages <list>` | `ar,en` | Comma-separated ISO codes LID may select; each must have a loaded recognizer |
 | `--host <host>` | `127.0.0.1` | Bind address |
 | `--port <port>` | `8080` | TCP listen port |
 | `--threads <n>` | backend default | ggml CPU thread count |
@@ -130,6 +136,7 @@ Send multipart form data to `POST /v1/audio/transcriptions`.
 | `file` | Yes | WAV file |
 | `response_format` | No | `json` (default), `text`, or `verbose_json` |
 | `timestamp_granularities[]` | No | Set to `word` with `verbose_json` to include word offsets |
+| `languages` / `languages[]` | No | OpenAI possible-input-languages field (ISO-639-1). Repeated `languages[]` parts and/or a CSV `languages` value. Intersected with `--supported-languages`; omitted requests use the process default |
 
 ```sh
 curl --fail-with-body \
@@ -148,13 +155,16 @@ X-Language-Confidence: 0.987654
 ```
 
 Successful responses use `200`. Invalid requests, missing files, unsupported
-formats, and undecodable WAV data use `400`. A detected language other than
-Arabic or English uses `422` with an OpenAI-style error JSON body. Failures
-during LID or transcription use `500` and are written to standard error.
+formats, and undecodable WAV data use `400`. When no language in
+`--supported-languages` can be selected from the LID scores, the server returns
+`422` with an OpenAI-style error JSON body. Failures during LID or
+transcription use `500` and are written to standard error.
 
 The endpoint accepts the OpenAI client `model`, `temperature`, and `prompt`
-form fields for client compatibility, but the server does not use them: model
-selection is based solely on LID and decoding is greedy.
+form fields for client compatibility, but the server does not use them for
+routing: model selection is based solely on closed-set LID and decoding is
+greedy. Optional OpenAI `languages` / `languages[]` further restricts the LID
+candidate set for that request.
 
 ## OpenAI client example
 
@@ -280,6 +290,6 @@ For an internet-facing deployment:
 | Process exits before listening | Verify all three GGUF paths and confirm the LID model is an ECAPA VoxLingua107 GGUF. |
 | Windows reports a missing `ggml*.dll` | Add `build-cpu/bin/Release` to `PATH` for build-tree execution, or deploy the DLLs with the executable. |
 | HTTP `400` | Supply a non-empty WAV upload in the multipart `file` field. |
-| HTTP `422` | LID detected a language other than `ar` or `en`; add a matching model only after implementing a routing policy for it. |
+| HTTP `422` | No language in `--supported-languages` matched LID scores, or a selected code has no recognizer; widen the supported list only when a matching model is loaded. |
 | Service accepts one request at a time | This is intentional. Add independent processes behind a proxy to increase throughput. |
 | Container cannot find models | Ensure the model directory is mounted at `/work`, or pass the three explicit model path options. |
